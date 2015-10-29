@@ -15,6 +15,8 @@
 package my.bhooshan.cdap;
 
 import co.cask.cdap.api.ProgramLifecycle;
+import co.cask.cdap.api.Resources;
+import co.cask.cdap.api.TaskLocalizationContext;
 import co.cask.cdap.api.app.AbstractApplication;
 import co.cask.cdap.api.common.Bytes;
 import co.cask.cdap.api.data.stream.StreamBatchReadable;
@@ -22,21 +24,36 @@ import co.cask.cdap.api.dataset.lib.KeyValueTable;
 import co.cask.cdap.api.flow.flowlet.StreamEvent;
 import co.cask.cdap.api.mapreduce.AbstractMapReduce;
 import co.cask.cdap.api.mapreduce.MapReduceContext;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataInputStream;
-import org.apache.hadoop.fs.FileSystem;
+import co.cask.cdap.api.mapreduce.MapReduceTaskContext;
+import co.cask.cdap.api.spark.AbstractSpark;
+import co.cask.cdap.api.spark.JavaSparkProgram;
+import co.cask.cdap.api.spark.SparkContext;
+import com.google.common.base.Charsets;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
+import com.google.common.base.Throwables;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.PairFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import scala.Tuple2;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.URI;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.StringTokenizer;
@@ -50,15 +67,22 @@ import java.util.StringTokenizer;
  * </uL>
  */
 public class WordCountWithStopwords extends AbstractApplication {
-
-  public static final String MR_OUTPUT_DATASET = "output";
-  public static final String STOPWORDS_FILE_ARG = "stopwords.file";
+  private static final Logger LOG = LoggerFactory.getLogger(WordCountWithStopwords.class);
+  private static final String MR_INPUT_STREAM = "LocalFileStream";
+  private static final String MR_OUTPUT_DATASET = "mr_output";
+  private static final String STOPWORDS_FILE_ARG = "stopwords.file";
+  private static final String STOPWORDS_ALIAS = "stopwords";
+  private static final String SPARK_OUTPUT_DATASET = "spark_output";
+  private static final String LOCAL_FILE_RUNTIME_ARG = "local.file";
+  private static final String LOCAL_ARCHIVE_ALIAS = "archive.jar";
 
   @Override
   public void configure() {
     createDataset(MR_OUTPUT_DATASET, KeyValueTable.class);
-    addStream("LocalFileStream");
+    createDataset(SPARK_OUTPUT_DATASET, KeyValueTable.class);
+    addStream(MR_INPUT_STREAM);
     addMapReduce(new MapReduceWithLocalFiles());
+    addSpark(new JavaSparkUsingLocalFiles());
   }
 
   public static class MapReduceWithLocalFiles extends AbstractMapReduce {
@@ -67,17 +91,17 @@ public class WordCountWithStopwords extends AbstractApplication {
     public void beforeSubmit(MapReduceContext context) throws Exception {
       Map<String, String> args = context.getRuntimeArguments();
       if (args.containsKey(STOPWORDS_FILE_ARG)) {
-        context.addLocalFile(URI.create(args.get(STOPWORDS_FILE_ARG)));
+        context.localize(STOPWORDS_ALIAS, URI.create(args.get(STOPWORDS_FILE_ARG)));
       }
-      context.setInput(new StreamBatchReadable("LocalFileStream"));
-      context.addOutput(args.get(MR_OUTPUT_DATASET));
+      context.setInput(new StreamBatchReadable(MR_INPUT_STREAM));
+      context.addOutput(MR_OUTPUT_DATASET);
       Job job = context.getHadoopJob();
       job.setMapperClass(TokenizerMapper.class);
       job.setReducerClass(IntSumReducer.class);
     }
 
     public static class TokenizerMapper extends Mapper<LongWritable, StreamEvent, Text, IntWritable>
-      implements ProgramLifecycle<MapReduceContext> {
+      implements ProgramLifecycle<MapReduceTaskContext> {
 
       private static final IntWritable ONE = new IntWritable(1);
       private Text word = new Text();
@@ -97,23 +121,16 @@ public class WordCountWithStopwords extends AbstractApplication {
       }
 
       @Override
-      public void initialize(MapReduceContext context) throws Exception {
-        List<URI> localFiles = context.getLocalFiles();
+      public void initialize(MapReduceTaskContext context) throws Exception {
+        Map<String, File> localFiles = context.getAllLocalFiles();
+        Preconditions.checkState(localFiles.containsKey(STOPWORDS_ALIAS));
         Map<String, String> args = context.getRuntimeArguments();
-        if (args.containsKey(STOPWORDS_FILE_ARG)) {
-          String localFilePath = args.get(STOPWORDS_FILE_ARG);
-          for (URI localFile : localFiles) {
-            if (localFilePath.equals(localFile.toString())) {
-              try (FileSystem fs = FileSystem.get(localFile, new Configuration());
-                   FSDataInputStream fds = fs.open(new org.apache.hadoop.fs.Path(localFile));
-                   InputStreamReader isr = new InputStreamReader(fds);
-                   BufferedReader reader = new BufferedReader(isr)) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                  stopWords.add(line);
-                }
-              }
-            }
+        Preconditions.checkState(args.containsKey(STOPWORDS_FILE_ARG));
+        try (BufferedReader reader = Files.newBufferedReader(context.getLocalFile(STOPWORDS_ALIAS).toPath(),
+                                                             Charsets.UTF_8)) {
+          String line;
+          while ((line = reader.readLine()) != null) {
+            stopWords.add(line);
           }
         }
       }
@@ -136,6 +153,70 @@ public class WordCountWithStopwords extends AbstractApplication {
         }
         context.write(Bytes.toBytes(key.toString()), Bytes.toBytes(sum));
       }
+    }
+  }
+
+  public static class JavaSparkUsingLocalFiles extends AbstractSpark {
+    @Override
+    protected void configure() {
+      setMainClass(JavaSparkProgramUsingLocalFiles.class);
+      setDriverResources(new Resources(1024));
+      setExecutorResources(new Resources(1024));
+    }
+
+    @Override
+    public void beforeSubmit(SparkContext context) throws Exception {
+      Map<String, String> args = context.getRuntimeArguments();
+      String localFilePath = args.get(LOCAL_FILE_RUNTIME_ARG);
+      Preconditions.checkArgument(localFilePath != null, "Runtime argument %s must be set.", LOCAL_FILE_RUNTIME_ARG);
+      context.localize(URI.create(localFilePath));
+      context.localize(LOCAL_ARCHIVE_ALIAS, File.createTempFile("archive", ".jar").toURI(), true);
+    }
+  }
+
+  public static class JavaSparkProgramUsingLocalFiles implements JavaSparkProgram {
+
+    @Override
+    public void run(SparkContext context) {
+      Map<String, String> args = context.getRuntimeArguments();
+      Preconditions.checkArgument(args.containsKey(LOCAL_FILE_RUNTIME_ARG),
+                                  "Runtime argument %s must be set.", LOCAL_FILE_RUNTIME_ARG);
+      final String localFilePath = URI.create(args.get(LOCAL_FILE_RUNTIME_ARG)).getPath();
+      final TaskLocalizationContext localizationContext = context.getTaskLocalizationContext();
+      Map<String, File> localFiles;
+      try {
+        localFiles = localizationContext.getAllLocalFiles();
+      } catch (IOException e) {
+        throw Throwables.propagate(e);
+      }
+      boolean localFileFound = false;
+      for (File localFile : localFiles.values()) {
+        if (localFilePath.equals(localFile.toString())) {
+          localFileFound = true;
+          break;
+        }
+      }
+      Preconditions.checkState(localFileFound, "Local file must be found.");
+      JavaSparkContext sc = context.getOriginalSparkContext();
+      JavaRDD<String> fileContents = sc.textFile(localFilePath, 1);
+      JavaPairRDD<byte[], byte[]> rows = fileContents.mapToPair(new PairFunction<String, byte[], byte[]>() {
+        @Override
+        public Tuple2<byte[], byte[]> call(String line) throws Exception {
+          File localFile = localizationContext.getLocalFile(
+            localFilePath.substring(localFilePath.lastIndexOf(Path.SEPARATOR) + 1));
+          Preconditions.checkState(localFile.exists(), "Local file %s must exist.", localFile);
+          File localArchive = localizationContext.getLocalFile(LOCAL_ARCHIVE_ALIAS, true);
+          Preconditions.checkState(localArchive.exists(), "Local archive %s must exist.", LOCAL_ARCHIVE_ALIAS);
+          Iterator<String> splitter = Splitter.on("=").omitEmptyStrings().trimResults().split(line).iterator();
+          Preconditions.checkArgument(splitter.hasNext());
+          String key = splitter.next();
+          Preconditions.checkArgument(splitter.hasNext());
+          String value = splitter.next();
+          return new Tuple2<>(Bytes.toBytes(key), Bytes.toBytes(value));
+        }
+      });
+
+      context.writeToDataset(rows, SPARK_OUTPUT_DATASET, byte[].class, byte[].class);
     }
   }
 }
