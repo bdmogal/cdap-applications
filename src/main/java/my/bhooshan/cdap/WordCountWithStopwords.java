@@ -28,6 +28,8 @@ import co.cask.cdap.api.mapreduce.MapReduceTaskContext;
 import co.cask.cdap.api.spark.AbstractSpark;
 import co.cask.cdap.api.spark.JavaSparkProgram;
 import co.cask.cdap.api.spark.SparkContext;
+import co.cask.cdap.common.io.Locations;
+import co.cask.cdap.common.lang.jar.BundleJarUtil;
 import com.google.common.base.Charsets;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Splitter;
@@ -170,7 +172,24 @@ public class WordCountWithStopwords extends AbstractApplication {
       String localFilePath = args.get(LOCAL_FILE_RUNTIME_ARG);
       Preconditions.checkArgument(localFilePath != null, "Runtime argument %s must be set.", LOCAL_FILE_RUNTIME_ARG);
       context.localize(URI.create(localFilePath));
-      context.localize(LOCAL_ARCHIVE_ALIAS, File.createTempFile("archive", ".jar").toURI(), true);
+      context.localize(LOCAL_ARCHIVE_ALIAS, createTemporaryArchiveFile(), true);
+    }
+
+    private URI createTemporaryArchiveFile() throws IOException {
+      File tmpDir1 = com.google.common.io.Files.createTempDir();
+      List<File> files = new ArrayList<>();
+      for (int i = 0; i < 3; i++) {
+        File tmpFile = File.createTempFile("abcd" + i, "txt", tmpDir1);
+        files.add(tmpFile);
+      }
+
+      File tmpDir2 = com.google.common.io.Files.createTempDir();
+      File destArchive = new File(tmpDir2, "myBundle.jar");
+      BundleJarUtil.createJar(tmpDir1, destArchive);
+      for (File file : files) {
+        BundleJarUtil.getEntry(Locations.toLocation(destArchive), file.getName()).getInput().close();
+      }
+      return destArchive.toURI();
     }
   }
 
@@ -181,7 +200,8 @@ public class WordCountWithStopwords extends AbstractApplication {
       Map<String, String> args = context.getRuntimeArguments();
       Preconditions.checkArgument(args.containsKey(LOCAL_FILE_RUNTIME_ARG),
                                   "Runtime argument %s must be set.", LOCAL_FILE_RUNTIME_ARG);
-      final String localFilePath = URI.create(args.get(LOCAL_FILE_RUNTIME_ARG)).getPath();
+      String localFilePath = URI.create(args.get(LOCAL_FILE_RUNTIME_ARG)).getPath();
+      final String localFileName = localFilePath.substring(localFilePath.lastIndexOf(Path.SEPARATOR) + 1);
       final TaskLocalizationContext localizationContext = context.getTaskLocalizationContext();
       Map<String, File> localFiles;
       try {
@@ -191,19 +211,20 @@ public class WordCountWithStopwords extends AbstractApplication {
       }
       boolean localFileFound = false;
       for (File localFile : localFiles.values()) {
-        if (localFilePath.equals(localFile.toString())) {
+        LOG.error("######################## localFilePath={}, localFileName={}, localFile={}",
+                  localFilePath, localFileName, localFile);
+        if (localFileName.equals(localFile.toString())) {
           localFileFound = true;
           break;
         }
       }
-      Preconditions.checkState(localFileFound, "Local file must be found.");
+      Preconditions.checkState(localFileFound, "Local file %s must be found.", localFilePath);
       JavaSparkContext sc = context.getOriginalSparkContext();
       JavaRDD<String> fileContents = sc.textFile(localFilePath, 1);
       JavaPairRDD<byte[], byte[]> rows = fileContents.mapToPair(new PairFunction<String, byte[], byte[]>() {
         @Override
         public Tuple2<byte[], byte[]> call(String line) throws Exception {
-          File localFile = localizationContext.getLocalFile(
-            localFilePath.substring(localFilePath.lastIndexOf(Path.SEPARATOR) + 1));
+          File localFile = localizationContext.getLocalFile(localFileName);
           Preconditions.checkState(localFile.exists(), "Local file %s must exist.", localFile);
           File localArchive = localizationContext.getLocalFile(LOCAL_ARCHIVE_ALIAS, true);
           Preconditions.checkState(localArchive.exists(), "Local archive %s must exist.", LOCAL_ARCHIVE_ALIAS);
