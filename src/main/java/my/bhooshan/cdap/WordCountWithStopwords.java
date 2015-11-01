@@ -33,7 +33,6 @@ import co.cask.cdap.common.lang.jar.BundleJarUtil;
 import com.google.common.base.Charsets;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Splitter;
-import com.google.common.base.Throwables;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.LongWritable;
@@ -77,6 +76,7 @@ public class WordCountWithStopwords extends AbstractApplication {
   private static final String SPARK_OUTPUT_DATASET = "spark_output";
   private static final String LOCAL_FILE_RUNTIME_ARG = "local.file";
   private static final String LOCAL_ARCHIVE_ALIAS = "archive.jar";
+  private static final String LOCAL_FILE_ALIAS = "local.properties";
 
   @Override
   public void configure() {
@@ -171,7 +171,7 @@ public class WordCountWithStopwords extends AbstractApplication {
       Map<String, String> args = context.getRuntimeArguments();
       String localFilePath = args.get(LOCAL_FILE_RUNTIME_ARG);
       Preconditions.checkArgument(localFilePath != null, "Runtime argument %s must be set.", LOCAL_FILE_RUNTIME_ARG);
-      context.localize(URI.create(localFilePath));
+      context.localize(LOCAL_FILE_ALIAS, URI.create(localFilePath));
       context.localize(LOCAL_ARCHIVE_ALIAS, createTemporaryArchiveFile(), true);
     }
 
@@ -203,17 +203,16 @@ public class WordCountWithStopwords extends AbstractApplication {
       String localFilePath = URI.create(args.get(LOCAL_FILE_RUNTIME_ARG)).getPath();
       final String localFileName = localFilePath.substring(localFilePath.lastIndexOf(Path.SEPARATOR) + 1);
       final TaskLocalizationContext localizationContext = context.getTaskLocalizationContext();
-      Map<String, File> localFiles;
-      try {
-        localFiles = localizationContext.getAllLocalFiles();
-      } catch (IOException e) {
-        throw Throwables.propagate(e);
-      }
+      Map<String, File> localFiles = localizationContext.getAllLocalFiles();
+      Preconditions.checkState(localFiles.containsKey(LOCAL_FILE_ALIAS),
+                               "File %s should have been localized with the name %s.", localFilePath, LOCAL_FILE_ALIAS);
+      Preconditions.checkState(localFiles.containsKey(LOCAL_ARCHIVE_ALIAS),
+                               "A temporary archive should have been localized with the name %s.", LOCAL_ARCHIVE_ALIAS);
       boolean localFileFound = false;
       for (File localFile : localFiles.values()) {
         LOG.error("######################## localFilePath={}, localFileName={}, localFile={}",
                   localFilePath, localFileName, localFile);
-        if (localFileName.equals(localFile.toString())) {
+        if (LOCAL_FILE_ALIAS.equals(localFile.toString())) {
           localFileFound = true;
           break;
         }
@@ -224,9 +223,9 @@ public class WordCountWithStopwords extends AbstractApplication {
       JavaPairRDD<byte[], byte[]> rows = fileContents.mapToPair(new PairFunction<String, byte[], byte[]>() {
         @Override
         public Tuple2<byte[], byte[]> call(String line) throws Exception {
-          File localFile = localizationContext.getLocalFile(localFileName);
+          File localFile = localizationContext.getLocalFile(LOCAL_FILE_ALIAS);
           Preconditions.checkState(localFile.exists(), "Local file %s must exist.", localFile);
-          File localArchive = localizationContext.getLocalFile(LOCAL_ARCHIVE_ALIAS, true);
+          File localArchive = localizationContext.getLocalFile(LOCAL_ARCHIVE_ALIAS);
           Preconditions.checkState(localArchive.exists(), "Local archive %s must exist.", LOCAL_ARCHIVE_ALIAS);
           Iterator<String> splitter = Splitter.on("=").omitEmptyStrings().trimResults().split(line).iterator();
           Preconditions.checkArgument(splitter.hasNext());

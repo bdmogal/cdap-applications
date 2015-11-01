@@ -18,6 +18,7 @@ package my.bhooshan.cdap;
 
 import co.cask.cdap.test.TestBase;
 import co.cask.cdap.test.TestConfiguration;
+import com.google.gson.Gson;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.filecache.DistributedCache;
 import org.apache.hadoop.fs.Path;
@@ -25,6 +26,7 @@ import org.apache.hadoop.mapreduce.Job;
 import org.junit.ClassRule;
 import org.junit.Test;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 
@@ -72,6 +74,12 @@ public class WordCountWithStopwordsTest {
     for (URI file : DistributedCache.getCacheFiles(conf)) {
       System.out.println("file = " + file);
     }
+
+    File file = new File("/Users/bhooshanmogal/work/git/cdap/pom.xml");
+    Gson gson = new Gson();
+    String string = gson.toJson(file);
+    System.out.println("######File = " + string);
+    File file1 = gson.fromJson(string, File.class);
   }
 
 
